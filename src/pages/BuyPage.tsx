@@ -1,12 +1,13 @@
 import { useState, useEffect } from 'react';
-import { useParams, Link, useSearchParams } from 'react-router-dom';
+import { useParams, Link, useSearchParams, useNavigate } from 'react-router-dom';
 import { useToast } from '@/hooks/use-toast';
 import { useCurrency } from '@/hooks/useCurrency';
 import { LoaderIcon, ShieldIcon, CheckCircleIcon, ChevronRightIcon, XIcon } from '@/components/icons';
-import { Copy } from 'lucide-react';
+import { Copy, Sparkles } from 'lucide-react';
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from '@/lib/supabaseProject';
 import { validateTransactionCode } from '@/lib/transactionValidation';
-import { PaymentMethodModal } from '@/components/PaymentMethodModal';
+import { supabase } from '@/integrations/supabase/client';
+import confetti from 'canvas-confetti';
 
 interface PaymentLinkData {
   id: string;
@@ -36,16 +37,17 @@ interface SellerPaymentMethod {
   account_number: string;
   is_active: boolean | null;
   is_default: boolean | null;
-  // Derived fields
+  method_name: string | null;
   payment_type: string;
   details: Record<string, string> | null;
 }
 
-type CheckoutStep = 'details' | 'select-method' | 'submit-payment' | 'submitting' | 'success';
+type CheckoutStep = 'details' | 'select-method' | 'instructions' | 'submitting' | 'success';
 
 export function BuyPage() {
   const { linkId } = useParams<{ linkId: string }>();
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   const { toast } = useToast();
   const { formatPrice } = useCurrency();
   const [link, setLink] = useState<PaymentLinkData | null>(null);
@@ -61,7 +63,6 @@ export function BuyPage() {
   const [submitting, setSubmitting] = useState(false);
   const [transactionId, setTransactionId] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
-  const [paymentConfirmed, setPaymentConfirmed] = useState(false);
 
   const [buyerInfo, setBuyerInfo] = useState({
     name: '',
@@ -70,12 +71,10 @@ export function BuyPage() {
     address: '',
   });
 
-  // Handle return from payment callback
   useEffect(() => {
     const paymentStatus = searchParams.get('payment');
     const reference = searchParams.get('reference');
     if (paymentStatus === 'success' && reference) {
-      setPaymentConfirmed(true);
       setShowCheckout(true);
       setCheckoutStep('success');
       setTransactionCode(reference);
@@ -96,37 +95,50 @@ export function BuyPage() {
       const result = await response.json();
       if (result.success && result.data) {
         setLink(result.data);
-        // Load seller payment methods
-        if (result.data.seller?.id) {
-          loadSellerMethods(result.data.seller.id);
-        }
+        if (result.data.seller?.id) loadSellerMethods(result.data.seller.id);
       } else {
         setError(result.error || 'Payment link not found');
       }
     } catch (err) {
-      console.error('Failed to load payment link:', err);
       setError('Failed to load payment link. Please try again.');
     } finally {
       setLoading(false);
     }
   };
 
-  const loadSellerMethods = async (_sellerId: string) => {
-    // Payment methods: M-Pesa Paybill (seller's payout method)
-    const hardcodedMethods: SellerPaymentMethod[] = [
-      {
-        id: 'mpesa-paybill',
-        provider: 'M-Pesa Paybill',
-        type: 'mobile_money',
-        account_name: 'Halearnedu Web',
-        account_number: '522522',
-        is_active: true,
-        is_default: true,
-        payment_type: 'PAYBILL',
-        details: { paybill_number: '522522', account_number: '1348763280' },
-      },
-    ];
-    setSellerMethods(hardcodedMethods);
+  const loadSellerMethods = async (sellerId: string) => {
+    try {
+      const { data } = await (supabase
+        .from('payment_methods' as any)
+        .select('*')
+        .eq('user_id', sellerId)
+        .eq('is_active', true)
+        .order('is_default', { ascending: false }) as any);
+
+      if (data && data.length > 0) {
+        setSellerMethods(data.map((m: any) => ({
+          ...m,
+          payment_type: m.payment_type || m.type || 'MPESA',
+          details: m.details || {},
+        })));
+      } else {
+        // Default PayLoom PayBill as fallback
+        setSellerMethods([{
+          id: 'payloom-default',
+          provider: 'PayLoom PayBill',
+          type: 'mobile_money',
+          account_name: 'PayLoom',
+          account_number: '522533',
+          is_active: true,
+          is_default: true,
+          method_name: 'PayLoom PayBill (Recommended)',
+          payment_type: 'PAYBILL',
+          details: { paybill_number: '522533', account_number: `PL-${sellerId.slice(0, 8).toUpperCase()}` },
+        }]);
+      }
+    } catch (err) {
+      console.error('Failed to load seller methods:', err);
+    }
   };
 
   const validateBuyerInfo = () => {
@@ -141,23 +153,18 @@ export function BuyPage() {
     return true;
   };
 
-  const handleContinueToMethod = () => {
+  const handleContinueToPay = () => {
     if (!validateBuyerInfo()) return;
-    if (sellerMethods.length > 0) {
-      setCheckoutStep('select-method');
-    } else {
-      toast({ title: 'No Payment Methods', description: 'Seller has not configured payment methods yet', variant: 'destructive' });
+    if (sellerMethods.length === 0) {
+      toast({ title: 'No Payment Methods', description: 'Seller has not configured payment methods', variant: 'destructive' });
+      return;
     }
+    setCheckoutStep('select-method');
   };
 
-  const handleSelectMethod = async (method: { id: string; type: string }) => {
-    const found = sellerMethods.find(m => m.id === method.id);
-    if (!found) return;
-
-    setSelectedMethod(found);
-
-    // For manual methods (M-Pesa etc.), go to submit-payment step
-    setCheckoutStep('submit-payment');
+  const handleSelectMethod = (method: SellerPaymentMethod) => {
+    setSelectedMethod(method);
+    setCheckoutStep('instructions');
   };
 
   const copyToClipboard = async (text: string, label: string) => {
@@ -166,9 +173,20 @@ export function BuyPage() {
     setTimeout(() => setCopied(null), 2000);
   };
 
+  const triggerConfetti = () => {
+    const duration = 3000;
+    const end = Date.now() + duration;
+    const frame = () => {
+      confetti({ particleCount: 3, angle: 60, spread: 55, origin: { x: 0 }, colors: ['#3d1a7a', '#5d2ba3', '#06d6a0', '#ffd700'] });
+      confetti({ particleCount: 3, angle: 120, spread: 55, origin: { x: 1 }, colors: ['#3d1a7a', '#5d2ba3', '#06d6a0', '#ffd700'] });
+      if (Date.now() < end) requestAnimationFrame(frame);
+    };
+    frame();
+  };
+
   const handleSubmitPayment = async () => {
-    // Validate transaction code
-    const validation = validateTransactionCode(transactionCode, selectedMethod?.payment_type);
+    if (!selectedMethod) return;
+    const validation = validateTransactionCode(transactionCode, selectedMethod.payment_type);
     if (!validation.valid) {
       setCodeError(validation.error || 'Invalid code');
       return;
@@ -178,7 +196,7 @@ export function BuyPage() {
     setCheckoutStep('submitting');
 
     try {
-      // Step 1: Create order
+      // Create order
       const orderResponse = await fetch(`${SUPABASE_URL}/functions/v1/links-api/${linkId}/purchase`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY },
@@ -187,19 +205,17 @@ export function BuyPage() {
           buyerPhone: buyerInfo.phone || undefined,
           buyerEmail: buyerInfo.email || undefined,
           deliveryAddress: buyerInfo.address || undefined,
-          paymentMethod: selectedMethod?.payment_type || 'MPESA',
+          paymentMethod: selectedMethod.payment_type || 'MPESA',
         }),
       });
-
       const orderResult = await orderResponse.json();
       if (!orderResult.success || !orderResult.data?.transactionId) {
         throw new Error(orderResult.error || 'Failed to create order');
       }
-
       const orderId = orderResult.data.transactionId;
       setTransactionId(orderId);
 
-      // Step 2: Submit payment for validation
+      // Submit for validation
       const validateResponse = await fetch(`${SUPABASE_URL}/functions/v1/validate-payment/submit`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', apikey: SUPABASE_ANON_KEY },
@@ -208,26 +224,137 @@ export function BuyPage() {
           transactionCode: transactionCode.trim().toUpperCase(),
           payerPhone: buyerInfo.phone,
           payerName: buyerInfo.name,
-          paymentMethod: selectedMethod?.payment_type || 'MPESA',
+          paymentMethod: selectedMethod.payment_type || 'MPESA',
           amountPaid: link?.price,
         }),
       });
-
       const validateResult = await validateResponse.json();
-      if (!validateResult.success) {
-        throw new Error(validateResult.error || 'Failed to submit payment');
-      }
+      if (!validateResult.success) throw new Error(validateResult.error || 'Failed to submit');
 
       setCheckoutStep('success');
+      triggerConfetti();
     } catch (err: any) {
-      toast({
-        title: 'Submission Error',
-        description: err.message || 'Failed to submit payment. Please try again.',
-        variant: 'destructive',
-      });
-      setCheckoutStep('submit-payment');
+      toast({ title: 'Error', description: err.message, variant: 'destructive' });
+      setCheckoutStep('instructions');
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const getMethodIcon = (method: SellerPaymentMethod) => {
+    const pt = method.payment_type;
+    if (pt === 'PAYBILL') return '🏢';
+    if (pt === 'TILL') return '🏪';
+    if (pt === 'BANK_ACCOUNT') return '🏦';
+    return '📱';
+  };
+
+  const getMethodLabel = (method: SellerPaymentMethod) => {
+    return method.method_name || method.provider || method.payment_type;
+  };
+
+  const getMethodSubtext = (method: SellerPaymentMethod) => {
+    const d = method.details || {};
+    if (d.paybill_number) return `PayBill: ${d.paybill_number} • Acc: ${d.account_number || method.account_number}`;
+    if (d.till_number) return `Till: ${d.till_number}`;
+    if (d.phone_number) return `Phone: ${d.phone_number}`;
+    if (d.bank_name) return `${d.bank_name} • ${d.account_number || method.account_number}`;
+    return method.account_number;
+  };
+
+  const renderInstructions = (method: SellerPaymentMethod) => {
+    const d = method.details || {};
+    const price = link?.price || 0;
+    const currency = link?.currency || 'KES';
+
+    switch (method.payment_type) {
+      case 'PAYBILL':
+        return (
+          <div className="space-y-4">
+            <div className="bg-primary/5 border border-primary/20 rounded-xl p-5">
+              <p className="text-sm font-bold text-foreground mb-4">📱 M-Pesa Paybill Instructions</p>
+              <ol className="space-y-3 text-sm text-foreground">
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">1</span>Go to M-Pesa → Lipa Na M-Pesa → Pay Bill</li>
+                <li className="flex gap-3 items-center">
+                  <span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">2</span>
+                  <span>Business Number: <strong className="font-mono text-primary">{d.paybill_number}</strong></span>
+                  <button onClick={() => copyToClipboard(d.paybill_number || '', 'pb')} className="ml-1 p-1 hover:bg-muted rounded transition">
+                    {copied === 'pb' ? <CheckCircleIcon size={14} className="text-primary" /> : <Copy size={14} className="text-muted-foreground" />}
+                  </button>
+                </li>
+                <li className="flex gap-3 items-center">
+                  <span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">3</span>
+                  <span>Account Number: <strong className="font-mono text-primary">{d.account_number || method.account_number}</strong></span>
+                  <button onClick={() => copyToClipboard(d.account_number || method.account_number, 'ac')} className="ml-1 p-1 hover:bg-muted rounded transition">
+                    {copied === 'ac' ? <CheckCircleIcon size={14} className="text-primary" /> : <Copy size={14} className="text-muted-foreground" />}
+                  </button>
+                </li>
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">4</span>Amount: <strong className="text-primary">{formatPrice(price, currency)}</strong></li>
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">5</span>Enter M-Pesa PIN and confirm</li>
+              </ol>
+            </div>
+          </div>
+        );
+      case 'TILL':
+        return (
+          <div className="space-y-4">
+            <div className="bg-primary/5 border border-primary/20 rounded-xl p-5">
+              <p className="text-sm font-bold text-foreground mb-4">📱 M-Pesa Buy Goods Instructions</p>
+              <ol className="space-y-3 text-sm text-foreground">
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">1</span>Go to M-Pesa → Lipa Na M-Pesa → Buy Goods</li>
+                <li className="flex gap-3 items-center">
+                  <span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">2</span>
+                  <span>Till Number: <strong className="font-mono text-primary">{d.till_number}</strong></span>
+                  <button onClick={() => copyToClipboard(d.till_number || '', 'tl')} className="ml-1 p-1 hover:bg-muted rounded transition">
+                    {copied === 'tl' ? <CheckCircleIcon size={14} className="text-primary" /> : <Copy size={14} className="text-muted-foreground" />}
+                  </button>
+                </li>
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">3</span>Amount: <strong className="text-primary">{formatPrice(price, currency)}</strong></li>
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">4</span>Enter M-Pesa PIN and confirm</li>
+              </ol>
+            </div>
+          </div>
+        );
+      case 'BANK_ACCOUNT':
+        return (
+          <div className="space-y-4">
+            <div className="bg-primary/5 border border-primary/20 rounded-xl p-5">
+              <p className="text-sm font-bold text-foreground mb-4">🏦 Bank Transfer Instructions</p>
+              <div className="space-y-2 text-sm">
+                <p>Bank: <strong>{d.bank_name}</strong></p>
+                <p className="flex items-center gap-2">Account: <strong className="font-mono">{d.account_number || method.account_number}</strong>
+                  <button onClick={() => copyToClipboard(d.account_number || method.account_number, 'ba')} className="p-1 hover:bg-muted rounded transition">
+                    {copied === 'ba' ? <CheckCircleIcon size={14} className="text-primary" /> : <Copy size={14} className="text-muted-foreground" />}
+                  </button>
+                </p>
+                <p>Name: <strong>{d.account_name || method.account_name}</strong></p>
+                {d.swift_code && <p>Swift: <strong className="font-mono">{d.swift_code}</strong></p>}
+                <p>Amount: <strong className="text-primary">{formatPrice(price, currency)}</strong></p>
+              </div>
+            </div>
+          </div>
+        );
+      default:
+        return (
+          <div className="space-y-4">
+            <div className="bg-primary/5 border border-primary/20 rounded-xl p-5">
+              <p className="text-sm font-bold text-foreground mb-4">📱 Send Money Instructions</p>
+              <ol className="space-y-3 text-sm text-foreground">
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">1</span>Open M-Pesa → Send Money</li>
+                <li className="flex gap-3 items-center">
+                  <span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">2</span>
+                  <span>Send to: <strong className="font-mono text-primary">{d.phone_number || method.account_number}</strong></span>
+                  <button onClick={() => copyToClipboard(d.phone_number || method.account_number, 'ph')} className="ml-1 p-1 hover:bg-muted rounded transition">
+                    {copied === 'ph' ? <CheckCircleIcon size={14} className="text-primary" /> : <Copy size={14} className="text-muted-foreground" />}
+                  </button>
+                </li>
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">3</span>Name: <strong>{d.account_name || method.account_name}</strong></li>
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">4</span>Amount: <strong className="text-primary">{formatPrice(price, currency)}</strong></li>
+                <li className="flex gap-3"><span className="w-6 h-6 rounded-full bg-primary text-primary-foreground flex items-center justify-center text-xs font-bold shrink-0">5</span>Enter PIN and confirm</li>
+              </ol>
+            </div>
+          </div>
+        );
     }
   };
 
@@ -261,97 +388,13 @@ export function BuyPage() {
 
   const discount = link.originalPrice ? Math.round(((link.originalPrice - link.price) / link.originalPrice) * 100) : 0;
 
-  const getMethodInstructions = (method: SellerPaymentMethod) => {
-    const details = method.details || {};
-    switch (method.payment_type) {
-      case 'PAYBILL':
-        return (
-          <div className="bg-primary/5 border border-primary/20 rounded-lg p-4 space-y-2">
-            <p className="text-sm font-bold text-foreground mb-3">📱 M-Pesa Paybill Instructions:</p>
-            <ol className="space-y-2 text-sm text-foreground">
-              <li className="flex gap-2"><span className="font-bold">1.</span><span>Go to M-Pesa → <strong>Lipa Na M-Pesa</strong> → <strong>Pay Bill</strong></span></li>
-              <li className="flex gap-2 items-center">
-                <span className="font-bold">2.</span>
-                <span>Business Number: <strong className="font-mono text-primary">{details.paybill_number}</strong></span>
-                <button onClick={() => copyToClipboard(details.paybill_number || '', 'paybill')} className="ml-2 p-1 hover:bg-muted rounded">
-                  {copied === 'paybill' ? <CheckCircleIcon size={14} className="text-primary" /> : <Copy size={14} className="text-muted-foreground" />}
-                </button>
-              </li>
-              <li className="flex gap-2 items-center">
-                <span className="font-bold">3.</span>
-                <span>Account Number: <strong className="font-mono text-primary">{details.account_number}</strong></span>
-                <button onClick={() => copyToClipboard(details.account_number || '', 'account')} className="ml-2 p-1 hover:bg-muted rounded">
-                  {copied === 'account' ? <CheckCircleIcon size={14} className="text-primary" /> : <Copy size={14} className="text-muted-foreground" />}
-                </button>
-              </li>
-              <li className="flex gap-2"><span className="font-bold">4.</span><span>Amount: <strong className="text-primary">{formatPrice(link.price, link.currency)}</strong></span></li>
-              <li className="flex gap-2"><span className="font-bold">5.</span><span>Enter your M-Pesa PIN and confirm</span></li>
-            </ol>
-          </div>
-        );
-      case 'TILL':
-        return (
-          <div className="bg-primary/5 border border-primary/20 rounded-lg p-4 space-y-2">
-            <p className="text-sm font-bold text-foreground mb-3">📱 M-Pesa Till Instructions:</p>
-            <ol className="space-y-2 text-sm text-foreground">
-              <li className="flex gap-2"><span className="font-bold">1.</span><span>Go to M-Pesa → <strong>Lipa Na M-Pesa</strong> → <strong>Buy Goods</strong></span></li>
-              <li className="flex gap-2 items-center">
-                <span className="font-bold">2.</span>
-                <span>Till Number: <strong className="font-mono text-primary">{details.till_number}</strong></span>
-                <button onClick={() => copyToClipboard(details.till_number || '', 'till')} className="ml-2 p-1 hover:bg-muted rounded">
-                  {copied === 'till' ? <CheckCircleIcon size={14} className="text-primary" /> : <Copy size={14} className="text-muted-foreground" />}
-                </button>
-              </li>
-              <li className="flex gap-2"><span className="font-bold">3.</span><span>Amount: <strong className="text-primary">{formatPrice(link.price, link.currency)}</strong></span></li>
-              <li className="flex gap-2"><span className="font-bold">4.</span><span>Enter your M-Pesa PIN and confirm</span></li>
-            </ol>
-          </div>
-        );
-      case 'MPESA':
-      case 'AIRTEL_MONEY':
-      case 'MTN_MONEY':
-        return (
-          <div className="bg-primary/5 border border-primary/20 rounded-lg p-4 space-y-2">
-            <p className="text-sm font-bold text-foreground mb-3">📱 Send Money Instructions:</p>
-            <ol className="space-y-2 text-sm text-foreground">
-              <li className="flex gap-2"><span className="font-bold">1.</span><span>Open {method.provider}</span></li>
-              <li className="flex gap-2 items-center">
-                <span className="font-bold">2.</span>
-                <span>Send to: <strong className="font-mono text-primary">{details.phone_number}</strong></span>
-                <button onClick={() => copyToClipboard(details.phone_number || '', 'phone')} className="ml-2 p-1 hover:bg-muted rounded">
-                  {copied === 'phone' ? <CheckCircleIcon size={14} className="text-primary" /> : <Copy size={14} className="text-muted-foreground" />}
-                </button>
-              </li>
-              <li className="flex gap-2"><span className="font-bold">3.</span><span>Name: <strong>{details.account_name || method.account_name}</strong></span></li>
-              <li className="flex gap-2"><span className="font-bold">4.</span><span>Amount: <strong className="text-primary">{formatPrice(link.price, link.currency)}</strong></span></li>
-            </ol>
-          </div>
-        );
-      case 'BANK_ACCOUNT':
-        return (
-          <div className="bg-primary/5 border border-primary/20 rounded-lg p-4 space-y-2">
-            <p className="text-sm font-bold text-foreground mb-3">🏦 Bank Transfer Instructions:</p>
-            <div className="space-y-1 text-sm text-foreground">
-              <p>Bank: <strong>{details.bank_name}</strong></p>
-              <p>Account: <strong className="font-mono">{details.account_number || method.account_number}</strong></p>
-              <p>Name: <strong>{details.account_name || method.account_name}</strong></p>
-              {details.swift_code && <p>Swift: <strong className="font-mono">{details.swift_code}</strong></p>}
-              <p>Amount: <strong className="text-primary">{formatPrice(link.price, link.currency)}</strong></p>
-            </div>
-          </div>
-        );
-      default:
-        return null;
-    }
-  };
-
   return (
     <div className="min-h-screen bg-background">
       {/* Header */}
       <header className="bg-card border-b border-border sticky top-0 z-10">
         <div className="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">
           <Link to="/" className="flex items-center gap-2">
-            <span className="text-lg font-bold text-foreground">Halearnedu<em className="text-primary not-italic">Web</em></span>
+            <span className="text-lg font-bold text-foreground">Pay<em className="text-primary not-italic">Loom</em></span>
           </Link>
           <div className="flex items-center gap-2 text-sm text-primary">
             <ShieldIcon size={16} />
@@ -420,59 +463,53 @@ export function BuyPage() {
             )}
 
             <div className="bg-primary/5 border border-primary/20 rounded-lg p-4 space-y-2">
-              <div className="flex items-center gap-2 text-sm">
-                <CheckCircleIcon size={16} className="text-primary" />
-                <span>Halearnedu Web Protection - Secure payment processing</span>
-              </div>
-              <div className="flex items-center gap-2 text-sm">
-                <CheckCircleIcon size={16} className="text-primary" />
-                <span>Money-back guarantee if item not received</span>
-              </div>
-              <div className="flex items-center gap-2 text-sm">
-                <CheckCircleIcon size={16} className="text-primary" />
-                <span>Manual verification for fraud protection</span>
-              </div>
+              <div className="flex items-center gap-2 text-sm"><CheckCircleIcon size={16} className="text-primary" /><span>PayLoom Protection - Secure payment processing</span></div>
+              <div className="flex items-center gap-2 text-sm"><CheckCircleIcon size={16} className="text-primary" /><span>Money-back guarantee if item not received</span></div>
+              <div className="flex items-center gap-2 text-sm"><CheckCircleIcon size={16} className="text-primary" /><span>Manual verification for fraud protection</span></div>
             </div>
 
             <button onClick={() => setShowCheckout(true)}
               className="w-full py-4 bg-primary text-primary-foreground rounded-lg font-bold text-lg hover:bg-primary/90 transition flex items-center justify-center gap-2">
-              Buy Now <ChevronRightIcon size={20} />
+              Continue to Pay <ChevronRightIcon size={20} />
             </button>
           </div>
         </div>
       </main>
 
       {/* Checkout Modal */}
-      {showCheckout && checkoutStep !== 'select-method' && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50" onClick={() => !submitting && setShowCheckout(false)} />
-          <div className="relative bg-card rounded-lg shadow-xl w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto border border-border">
-            <div className="p-6 border-b border-border flex items-center justify-between">
-              <h2 className="text-xl font-bold text-foreground">
+      {showCheckout && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center">
+          <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" onClick={() => !submitting && setShowCheckout(false)} />
+          <div className="relative bg-card rounded-t-2xl sm:rounded-2xl shadow-2xl w-full max-w-md sm:mx-4 max-h-[92vh] overflow-y-auto border border-border">
+            {/* Modal Header */}
+            <div className="sticky top-0 bg-card z-10 p-5 border-b border-border flex items-center justify-between rounded-t-2xl">
+              <h2 className="text-lg font-bold text-foreground">
                 {checkoutStep === 'details' && 'Your Details'}
-                {(checkoutStep as string) === 'select-method' && 'Select Payment Method'}
-                {checkoutStep === 'submit-payment' && 'Complete Payment'}
-                {checkoutStep === 'submitting' && 'Submitting...'}
-                {checkoutStep === 'success' && 'Payment Submitted!'}
+                {checkoutStep === 'select-method' && 'Choose Payment Method'}
+                {checkoutStep === 'instructions' && 'Complete Payment'}
+                {checkoutStep === 'submitting' && 'Verifying...'}
+                {checkoutStep === 'success' && '🎉 Payment Received!'}
               </h2>
-              {!submitting && (
-                <button onClick={() => { setShowCheckout(false); setCheckoutStep('details'); }} className="p-2 hover:bg-muted rounded-full">
+              {!submitting && checkoutStep !== 'success' && (
+                <button onClick={() => { setShowCheckout(false); setCheckoutStep('details'); }} className="p-2 hover:bg-muted rounded-full transition">
                   <XIcon size={20} />
                 </button>
               )}
             </div>
 
-            <div className="p-6 space-y-5">
-              {/* Order Summary */}
-              <div className="bg-muted rounded-lg p-4">
-                <div className="flex gap-4">
-                  {link.images?.[0] && <img src={link.images[0]} alt="" className="w-16 h-16 object-cover rounded-lg" />}
-                  <div className="flex-1">
-                    <p className="font-medium text-foreground">{link.productName}</p>
-                    <p className="text-lg font-bold text-primary">{formatPrice(link.price, link.currency)}</p>
+            <div className="p-5 space-y-5">
+              {/* Order Summary (always visible except success) */}
+              {checkoutStep !== 'success' && (
+                <div className="bg-muted rounded-xl p-4">
+                  <div className="flex gap-4">
+                    {link.images?.[0] && <img src={link.images[0]} alt="" className="w-16 h-16 object-cover rounded-lg" />}
+                    <div className="flex-1">
+                      <p className="font-medium text-foreground">{link.productName}</p>
+                      <p className="text-xl font-bold text-primary">{formatPrice(link.price, link.currency)}</p>
+                    </div>
                   </div>
                 </div>
-              </div>
+              )}
 
               {/* Step: Buyer Details */}
               {checkoutStep === 'details' && (
@@ -480,56 +517,93 @@ export function BuyPage() {
                   <div>
                     <label className="block text-sm font-medium text-foreground mb-1">Full Name *</label>
                     <input type="text" value={buyerInfo.name} onChange={e => setBuyerInfo({...buyerInfo, name: e.target.value})}
-                      placeholder="John Doe" className="w-full px-3 py-2 border border-input rounded-lg bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20" />
+                      placeholder="John Doe" className="w-full px-4 py-3 border border-input rounded-xl bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition" />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-foreground mb-1">Phone Number *</label>
                     <input type="tel" value={buyerInfo.phone} onChange={e => setBuyerInfo({...buyerInfo, phone: e.target.value})}
-                      placeholder="+254712345678" className="w-full px-3 py-2 border border-input rounded-lg bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20" />
+                      placeholder="+254712345678" className="w-full px-4 py-3 border border-input rounded-xl bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition" />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-foreground mb-1">Email (Optional)</label>
                     <input type="email" value={buyerInfo.email} onChange={e => setBuyerInfo({...buyerInfo, email: e.target.value})}
-                      placeholder="you@example.com" className="w-full px-3 py-2 border border-input rounded-lg bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20" />
+                      placeholder="you@example.com" className="w-full px-4 py-3 border border-input rounded-xl bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 transition" />
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-foreground mb-1">Delivery Address (Optional)</label>
                     <textarea value={buyerInfo.address} onChange={e => setBuyerInfo({...buyerInfo, address: e.target.value})}
-                      placeholder="Enter delivery address" rows={2} className="w-full px-3 py-2 border border-input rounded-lg bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 resize-none" />
+                      placeholder="Enter delivery address" rows={2} className="w-full px-4 py-3 border border-input rounded-xl bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary/20 resize-none transition" />
                   </div>
-                  <button onClick={handleContinueToMethod}
-                    className="w-full py-3 bg-primary text-primary-foreground rounded-lg font-semibold hover:bg-primary/90 transition">
-                    Continue to Payment →
+                  <button onClick={handleContinueToPay}
+                    className="w-full py-4 bg-primary text-primary-foreground rounded-xl font-bold text-base hover:bg-primary/90 transition">
+                    Continue to Pay →
                   </button>
                 </div>
               )}
 
-              {/* Step: Select Payment Method - rendered as overlay modal */}
+              {/* Step: Select Payment Method */}
+              {checkoutStep === 'select-method' && (
+                <div className="space-y-3">
+                  <p className="text-sm text-muted-foreground">Select how you'd like to pay:</p>
+                  {sellerMethods.map((method, index) => (
+                    <button
+                      key={method.id}
+                      onClick={() => handleSelectMethod(method)}
+                      className={`w-full text-left p-4 rounded-xl border-2 transition-all duration-200 hover:shadow-md ${
+                        selectedMethod?.id === method.id
+                          ? 'border-primary bg-primary/5 shadow-sm'
+                          : 'border-border hover:border-primary/50'
+                      }`}
+                    >
+                      <div className="flex items-center gap-4">
+                        <div className="w-12 h-12 rounded-xl bg-primary/10 flex items-center justify-center text-2xl shrink-0">
+                          {getMethodIcon(method)}
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <p className="font-semibold text-foreground">{getMethodLabel(method)}</p>
+                            {index === 0 && method.is_default && (
+                              <span className="px-2 py-0.5 bg-primary/10 text-primary text-[10px] font-bold rounded-full flex items-center gap-1">
+                                <Sparkles size={10} /> Recommended
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-sm text-muted-foreground mt-0.5">{getMethodSubtext(method)}</p>
+                        </div>
+                        <ChevronRightIcon size={18} className="text-muted-foreground shrink-0" />
+                      </div>
+                    </button>
+                  ))}
+                  <button onClick={() => setCheckoutStep('details')}
+                    className="w-full py-3 border border-input rounded-xl text-foreground hover:bg-muted transition text-sm font-medium">
+                    ← Back
+                  </button>
+                </div>
+              )}
 
-              {/* Step: Submit Payment */}
-              {checkoutStep === 'submit-payment' && selectedMethod && (
+              {/* Step: Payment Instructions + Transaction Code */}
+              {checkoutStep === 'instructions' && selectedMethod && (
                 <div className="space-y-4">
-                  {getMethodInstructions(selectedMethod)}
+                  {renderInstructions(selectedMethod)}
 
-                  <div className="bg-accent/10 border border-accent/20 rounded-lg p-3 text-sm text-foreground">
-                    <strong>⚠️ Important:</strong> Pay the exact amount of <strong>{formatPrice(link.price, link.currency)}</strong>. 
-                    After paying, enter your transaction code below.
+                  <div className="bg-accent/10 border border-accent/20 rounded-xl p-4 text-sm text-foreground">
+                    <strong>⚠️ Important:</strong> Pay exactly <strong className="text-primary">{formatPrice(link.price, link.currency)}</strong>. After paying, enter your M-Pesa transaction code below.
                   </div>
 
                   <div>
-                    <label className="block text-sm font-medium text-foreground mb-1">Transaction Code *</label>
+                    <label className="block text-sm font-bold text-foreground mb-2">Transaction Code *</label>
                     <input type="text" value={transactionCode}
                       onChange={e => { setTransactionCode(e.target.value.toUpperCase()); setCodeError(null); }}
                       placeholder="e.g. SJK7Y6H4TQ" maxLength={13}
-                      className="w-full px-3 py-3 border border-input rounded-lg bg-background text-foreground font-mono text-lg tracking-wider focus:outline-none focus:ring-2 focus:ring-primary/20 uppercase" />
+                      className="w-full px-4 py-4 border border-input rounded-xl bg-background text-foreground font-mono text-lg tracking-wider focus:outline-none focus:ring-2 focus:ring-primary/20 uppercase transition" />
                     {codeError && <p className="text-xs text-destructive mt-1">{codeError}</p>}
                   </div>
 
                   <div className="flex gap-3">
-                    <button onClick={() => setCheckoutStep('select-method')} className="flex-1 px-4 py-3 border border-input rounded-lg text-foreground hover:bg-muted transition text-sm font-medium">← Back</button>
+                    <button onClick={() => setCheckoutStep('select-method')} className="flex-1 py-3 border border-input rounded-xl text-foreground hover:bg-muted transition text-sm font-medium">← Back</button>
                     <button onClick={handleSubmitPayment} disabled={!transactionCode.trim()}
-                      className="flex-1 px-4 py-3 bg-primary text-primary-foreground rounded-lg font-semibold hover:bg-primary/90 transition disabled:opacity-50">
-                      Submit Payment
+                      className="flex-1 py-3 bg-primary text-primary-foreground rounded-xl font-bold hover:bg-primary/90 transition disabled:opacity-50">
+                      Confirm Payment
                     </button>
                   </div>
                 </div>
@@ -537,41 +611,49 @@ export function BuyPage() {
 
               {/* Step: Submitting */}
               {checkoutStep === 'submitting' && (
-                <div className="py-8 text-center">
-                  <LoaderIcon size={40} className="animate-spin text-primary mx-auto mb-4" />
-                  <h3 className="font-bold text-foreground mb-2">Verifying Payment...</h3>
-                  <p className="text-sm text-muted-foreground">Checking transaction code <strong className="font-mono">{transactionCode}</strong></p>
+                <div className="py-12 text-center">
+                  <div className="w-16 h-16 border-4 border-primary border-t-transparent rounded-full animate-spin mx-auto mb-6" />
+                  <h3 className="font-bold text-foreground text-lg mb-2">Verifying Payment...</h3>
+                  <p className="text-sm text-muted-foreground">Checking transaction code <strong className="font-mono text-primary">{transactionCode}</strong></p>
                 </div>
               )}
 
               {/* Step: Success */}
               {checkoutStep === 'success' && (
                 <div className="py-4 text-center">
-                  <div className="w-16 h-16 bg-primary/10 rounded-full flex items-center justify-center mx-auto mb-4">
-                    <CheckCircleIcon size={32} className="text-primary" />
+                  {/* Animated checkmark */}
+                  <div className="relative w-24 h-24 mx-auto mb-6">
+                    <div className="absolute inset-0 bg-primary/20 rounded-full animate-ping" />
+                    <div className="relative w-24 h-24 bg-gradient-to-br from-primary to-primary/80 rounded-full flex items-center justify-center shadow-lg shadow-primary/30">
+                      <CheckCircleIcon size={48} className="text-primary-foreground" />
+                    </div>
                   </div>
-                  <h3 className="text-lg font-bold text-foreground mb-2">
-                   {paymentConfirmed ? 'Payment Successful!' : 'Payment Submitted!'}
-                  </h3>
-                  <p className="text-sm text-muted-foreground mb-4">
-                    {paymentConfirmed
-                      ? 'Your payment has been confirmed. Your order is being processed.'
-                      : 'Your payment is being reviewed. You\'ll be notified once it\'s approved.'}
-                  </p>
-                  <div className="bg-muted rounded-lg p-4 text-left text-sm space-y-2 mb-4">
-                    {transactionId && <p>Order ID: <span className="font-mono font-bold">{transactionId}</span></p>}
-                    {transactionCode && <p>Reference: <span className="font-mono font-bold">{transactionCode}</span></p>}
-                    <p>Status: <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${paymentConfirmed ? 'bg-green-100 text-green-700' : 'bg-accent/20 text-accent'}`}>
-                      {paymentConfirmed ? 'Confirmed' : 'Under Review'}
-                    </span></p>
+
+                  <h3 className="text-2xl font-black text-foreground mb-2">Payment Received!</h3>
+                  <p className="text-muted-foreground mb-6">Your payment is being verified by the seller. You'll receive an SMS confirmation once approved.</p>
+
+                  <div className="bg-muted rounded-xl p-4 text-left text-sm space-y-2 mb-6">
+                    {transactionId && <div className="flex justify-between"><span className="text-muted-foreground">Order ID:</span><code className="font-mono font-bold text-foreground">{transactionId.slice(0, 16)}...</code></div>}
+                    <div className="flex justify-between"><span className="text-muted-foreground">Amount:</span><span className="font-bold text-primary">{formatPrice(link.price, link.currency)}</span></div>
+                    {transactionCode && <div className="flex justify-between"><span className="text-muted-foreground">Transaction:</span><code className="font-mono font-bold text-foreground">{transactionCode}</code></div>}
+                    <div className="flex justify-between"><span className="text-muted-foreground">Status:</span><span className="px-2 py-0.5 bg-accent/20 text-accent-foreground rounded-full text-xs font-medium">⏳ Under Review</span></div>
                   </div>
-                  <div className="bg-primary/5 border border-primary/20 rounded-lg p-3 text-sm text-left mb-4">
-                    <ShieldIcon size={16} className="inline text-primary mr-1" />
-                    Your payment is protected by Halearnedu Web. If there's any issue, we'll process a full refund.
+
+                  <div className="bg-primary/5 border border-primary/20 rounded-xl p-4 text-sm text-left mb-6 flex items-start gap-3">
+                    <ShieldIcon size={20} className="text-primary mt-0.5 shrink-0" />
+                    <div>
+                      <p className="font-semibold text-foreground mb-1">Your funds are protected</p>
+                      <p className="text-muted-foreground text-xs">PayLoom holds your payment in escrow until you confirm delivery. Full refund if there's any issue.</p>
+                    </div>
                   </div>
+
+                  <button onClick={() => navigate(`/track/${transactionId}`)}
+                    className="w-full py-4 bg-primary text-primary-foreground rounded-xl font-bold text-base hover:bg-primary/90 transition flex items-center justify-center gap-2 shadow-lg shadow-primary/20">
+                    Track Your Delivery Status →
+                  </button>
                   <button onClick={() => { setShowCheckout(false); setCheckoutStep('details'); }}
-                    className="w-full py-3 bg-primary text-primary-foreground rounded-lg font-semibold hover:bg-primary/90 transition">
-                    {paymentConfirmed ? 'Done' : 'View Payment Status'}
+                    className="w-full py-3 text-muted-foreground hover:text-foreground transition text-sm mt-2">
+                    Done
                   </button>
                 </div>
               )}
@@ -579,33 +661,6 @@ export function BuyPage() {
           </div>
         </div>
       )}
-
-      {/* Payment Method Selection Modal */}
-      <PaymentMethodModal
-        isOpen={checkoutStep === 'select-method'}
-        onClose={() => { setCheckoutStep('details'); }}
-        onBack={() => setCheckoutStep('details')}
-        onContinue={(method) => handleSelectMethod(method)}
-        product={{
-          name: link.productName,
-          price: link.price,
-          currency: link.currency,
-          image: link.images?.[0],
-        }}
-        methods={sellerMethods.map(m => ({
-          id: m.id,
-          type: 'mpesa' as const,
-          name: `Pay via ${m.provider}`,
-          description: m.details?.paybill_number
-            ? `Paybill ${m.details.paybill_number} • Account ${m.details.account_number}`
-            : m.details?.till_number
-              ? `Till: ${m.details.till_number}`
-              : m.provider,
-          icon: (
-            <div className="w-11 h-11 rounded-[10px] flex items-center justify-center font-bold text-xl shrink-0" style={{ background: '#d4f4dd', color: '#00a86b' }}>M-P</div>
-          ),
-        }))}
-      />
     </div>
   );
 }
